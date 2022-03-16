@@ -1,112 +1,148 @@
 #!/usr/bin/python3
-from urllib.request import urlopen, urlretrieve
-import urllib.parse
 import os, re, sys, argparse, random, string
 from bs4 import BeautifulSoup
-from time import sleep
 from colorama import init, Fore, Style
+import asyncio, aiohttp, aiofiles
 #---------------------------------------------------------------------------------
 init(autoreset=True)
-print(Fore.MAGENTA+Style.BRIGHT+r"""
-     |
-  /  |   \
- ;_/,L-,\_;     VIMP Video Crawler
-\._/3  E\_./    
-\_./(::)\._/
-     ""
-""")
+ascii_art = r"""
+                                   _
+       /      \         __      _\( )/_
+    \  \  ,,  /  /   | /  \ |    /(O)\ 
+     '-.`\()/`.-'   \_\\  //_/    _.._   _\(o)/_  //  \\
+    .--_'(  )'_--.   .'/()\'.   .'    '.  /(_)\  _\\()//_
+   / /` /`""`\ `\ \   \\  //   /   __   \       / //  \\ \
+    |  |  ><  |  | VIMP     ,  |   ><   |  ,     | \__/ |
+    \  \      /  / SCRAPPER. \  \      /  / .              _
+   _    '.__.'    _\(O)/_   \_'--`(  )'--'_/     __     _\(_)/_
+_\( )/_            /(_)\      .--'/()\'--.    | /  \ |   /(O)\
+ /(O)\  //  \\     2022_     /  /` '' `\  \  \_\\  //_/
+       _\\()//_     _\(_)/_    |        |      //()\\ 
+ jgs  / //  \\ \     /(o)\      \      /       \\  //
+       | \__/ |     VIMP VIDEO DOWNLADER
+"""
+print(Fore.MAGENTA+Style.BRIGHT+ascii_art)
 
 argparser = argparse.ArgumentParser()
 argparser.add_argument("-u", "--url", help="Search or video URL to download", metavar="URL", required=True)
 argparser.add_argument("-o", "--out", help="Output directory", metavar="DIR")
 args = argparser.parse_args()
 
-def download(link):
-    try:
-        req = urlopen(link)
-    except Exception as ex:
-        print(Fore.RED+"[!] Ha ocurrido un error encontrando los videos:",ex)
-        sys.exit()
-    html = req.read()
-    soup = BeautifulSoup(html,"html.parser")
-    tags = soup.find_all(attrs={"class":"mediaInfo"})
+
+async def get_urlinfo(url):
+    if url[:5].lower() == "https" or url[:4].lower() == "http":
+        urlsplt = re.split("/+", url)
+        hostname = urlsplt[0]+"//"+urlsplt[1]
+    else:
+        hostname = url.split("/")[0]
     
-    if not tags:
-        print(Fore.RED+"[!] No se encontraron videos para descargar.")
-        sys.exit() 
+    return hostname, urlsplt[-2]
 
-    for tag in tags:
-        regex = "[a-z0-9]{32}"
-        video_hash = re.search(regex, url)
+async def search_pages(html):
+    print(Fore.BLUE+"[#] Buscando páginas...")
+    link_pages = re.search("(?<=<!-- pages -->).*?(?=<!-- next page -->)", html, re.DOTALL)
+    try:
+        return link_pages.group(0)
+    except AttributeError as ex:
+        return
 
-        if video_hash:
-            title = urlsplt[-2]
-            video_hash = video_hash.group(0)
-        else:
-            link = tag.a.get("href", None)
-            video_hash = re.search(regex, link).group(0)
-            if not video_hash:
-                print(Fore.RED+"[!] No se encontró el hash del video.")
-                sys.exit()
-            title=link.split("/")[-2]
+async def do_soup(url, pages):
+    soup = BeautifulSoup(pages, "html.parser")
+    # link_tags = soup("a")
 
-        video_link = video_link = hostname+"/getMedium/"+video_hash+".m4v"
+    links = [tag.get("href", None) for tag in soup("a")]
+    links.insert(0, url)
 
-        if args.out:
-            out = args.out
-        else:
-            out = title
+    print(Fore.BLUE+"[#] La busqueda cuenta con " + str(len(links)) + " páginas.") 
+    
+    return links
+
+async def get_videolink(link, session):
+    async with session.get(link) as res:
+        html = await res.text()
+        soup =  BeautifulSoup(html, "html.parser")
+        tag = soup.source
+        link = tag["src"]
+        fmt = tag["type"].split("/")[-1]
+    return link, fmt
+
+async def do_real_soup(url_info, session):
+    link, url = url_info
+    hostname, _ = await get_urlinfo(url)
+    video_links = []
+
+    async with session.get(link) as res:
+
+        html = await res.text()
+        soup = BeautifulSoup(html,"html.parser")
+        tags = soup.find_all(attrs={"class":"mediaInfo"})
+
+        if not tags:
+            print(Fore.RED+"[!] No se encontraron videos para descargar.")
+            sys.exit() 
+
+        video_links_fmt = await asyncio.gather(*[asyncio.create_task(get_videolink(hostname + tag.a.get("href", None), session)) for tag in tags ])
+        video_links = []
+        for i,tup in enumerate(video_links_fmt):
+            for tag in tags:
+                video_links.append((tag.a.get("href", None).split("/")[-2],) + tup)
+                video_links_fmt.pop(i)
+                
+    return video_links
+
+async def download_file(video_info, session):
+
+    video_link, out, title, fmt = video_info
+
+    async with session.get(video_link) as res:
+
         if not os.path.exists(out):
             os.makedirs(out)
-
         try:
             print(Fore.BLUE+"[#] Descargando "+title+"...")
 
-            if os.path.exists(os.path.join(out, title+".m4v")):
+            if os.path.exists(os.path.join(out, title + "." + fmt)):
                 print(Fore.YELLOW+"[!] "+title+" ya existe, añadiendo carácteres aleatorios.")
                 title += "_" + "".join(random.choice(string.ascii_letters + string.digits) for i in range(8))
 
-            urllib.request.urlretrieve(video_link, out + "/" + title + ".m4v")
+            async with aiofiles.open(os.path.join(out, title + "." + fmt), "wb") as video_file:
+                async for data in res.content.iter_any():
+                    await video_file.write(data)
             print(Fore.GREEN+"[#] " + title + " descargado.")
-            sleep(1)
+
         except Exception as ex:
             print(Fore.RED+"[!] Ha ocurrido un error descargando los videos:", ex)
             sys.exit()
 
-url = args.url
+async def main():
+    url = args.url
+    out = args.out
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as res:
 
-if url[:5].lower() == "https" or url[:4].lower() == "http":
-    urlsplt = re.split("/+", url)
-    hostname = urlsplt[0]+"//"+urlsplt[1]
-else:
-    hostname = url.split("/")[0]
-try:
-    req = urlopen(url)
-except Exception as ex:
-    print(Fore.RED+"[!] Verifique que el URL esté correcto o revise su conexión")
-    sys.exit()
+            html = await res.text()
+            pages = await search_pages(html)
 
-first_page = req.geturl()
+            tasks = []
+            if pages:
+                out = args.out
+                page_links = await do_soup(url, pages)
+                for link in page_links:
+                    print(Fore.BLUE + "[#] Buscando videos en la página " + str(page_links.index(link)+1))
+                    video_links = await do_real_soup([link, url], session)
+                    for title, video_link, fmt in video_links:
+                        if not args.out:
+                            out = title
+                        tasks.append(asyncio.create_task(download_file([video_link, out, title, fmt], session)))
+                    await asyncio.gather(*tasks)
+                   
+            else:
+                print(Fore.YELLOW+"[*] No se han encontrado páginas, intentando como fichero individual")
+                _, title = await get_urlinfo(url)
+                if not args.out:
+                    out = title
+                video_link, fmt = await get_videolink(url, session)
+                await asyncio.create_task(download_file([video_link, out, title, fmt], session))
 
-html = req.read().decode()
-
-print(Fore.BLUE+"[#] Buscando páginas...")
-link_pages = re.search("(?<=<!-- pages -->).*?(?=<!-- next page -->)", html, re.DOTALL)    
-
-if link_pages:
-    links_html = link_pages.group(0)
-    soup = BeautifulSoup(links_html, "html.parser")
-    tags = soup("a")
-
-    links = [tag.get("href", None) for tag in tags]
-    links.insert(0, first_page)
-
-    print(Fore.BLUE+"[#] La busqueda cuenta con " + str(len(links)) + " páginas.")  
-    
-
-    for link in links:
-        print(Fore.BLUE+"[#] Buscando videos en la página "+str(links.index(link)+1))
-        download(link)
-else:
-    print(Fore.YELLOW+"[!] No se han encontrado páginas, intentando como video individual...")
-    download(url)
+if __name__ == "__main__":
+    asyncio.run(main())
